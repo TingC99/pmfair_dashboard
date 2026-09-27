@@ -482,6 +482,25 @@ def compute_case_last_activity(events: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def compute_case_activity_presence(events: pd.DataFrame, activity: str) -> pd.DataFrame:
+    """
+    Case-level outcome proxy: whether `activity` occurs anywhere in the case's trace.
+
+    Using "last activity" as the outcome proxy only works when the chosen outcome
+    activity is truly terminal. Some logs keep recording events after the outcome
+    (e.g. a rental log continues with "Move In"/"Pay Rent" after "Sign Contract"),
+    and some cases are censored (the log window ends before any terminal state is
+    reached). "Occurs anywhere" is dataset-agnostic and degrades gracefully to
+    last-activity matching when the activity really is terminal.
+
+    Returns: [case_id] (one row per case containing the activity at least once).
+    """
+    if events is None or events.empty or not activity:
+        return pd.DataFrame(columns=["case_id"])
+    return events.loc[events["activity"] == activity, ["case_id"]].drop_duplicates()
+
+
+@st.cache_data(show_spinner=False)
 def compute_outcome_disparity(
     case_outcome_df: pd.DataFrame,
     cases: pd.DataFrame,
@@ -816,23 +835,39 @@ def compute_offer_reject_series(
     target_group,
     offer_act: str,
     reject_act: str,
+    match_mode: str = "Last activity in case",
     n_bins: int = 12,
 ):
-    """Compute per-time-bin delta offer/reject rates (pp) based on case end time."""
+    """Compute per-time-bin delta offer/reject rates (pp) based on case end time.
+
+    match_mode mirrors the outcome dashboard's "Match outcome activity as" setting:
+    "Anywhere in case" flags a case if the activity occurs anywhere in its trace
+    (see compute_case_activity_presence); "Last activity in case" (default) only
+    counts it when it is the case's final event. Time-binning always uses the
+    case's last event timestamp as its "end time"."""
     if events is None or events.empty:
         return {"offer": [], "reject": []}
-    # end activity + end ts per case
+    # end ts per case (for time binning only)
     last = (
         events.sort_values(["case_id", "ts"])
         .groupby("case_id", sort=False)
         .tail(1)[["case_id", "activity", "ts"]]
-        .rename(columns={"activity": "outcome", "ts": "end_ts"})
+        .rename(columns={"ts": "end_ts"})
     )
+
+    if match_mode == "Anywhere in case":
+        offer_cases = set(compute_case_activity_presence(events, offer_act)["case_id"]) if offer_act else set()
+        reject_cases = set(compute_case_activity_presence(events, reject_act)["case_id"]) if reject_act else set()
+    else:
+        offer_cases = set(last.loc[last["activity"] == offer_act, "case_id"]) if offer_act else set()
+        reject_cases = set(last.loc[last["activity"] == reject_act, "case_id"]) if reject_act else set()
 
     cc = cases[["case_id", sensitive_attr]].dropna().copy()
     df = last.merge(cc, on="case_id", how="inner").rename(columns={sensitive_attr: "group"})
     if df.empty:
         return {"offer": [], "reject": []}
+    df["is_offer"] = df["case_id"].isin(offer_cases)
+    df["is_reject"] = df["case_id"].isin(reject_cases)
 
     # bins by time range
     tmin = df["end_ts"].min()
@@ -852,14 +887,14 @@ def compute_offer_reject_series(
             out_reject.append(np.nan)
             continue
 
-        sup_offer_ref = int(((g["group"] == ref_group) & (g["outcome"] == offer_act)).sum())
-        sup_offer_tgt = int(((g["group"] == target_group) & (g["outcome"] == offer_act)).sum())
+        sup_offer_ref = int(((g["group"] == ref_group) & g["is_offer"]).sum())
+        sup_offer_tgt = int(((g["group"] == target_group) & g["is_offer"]).sum())
         p_offer_ref = sup_offer_ref / n_ref
         p_offer_tgt = sup_offer_tgt / n_tgt
         out_offer.append((p_offer_tgt - p_offer_ref) * 100.0)
 
-        sup_rej_ref = int(((g["group"] == ref_group) & (g["outcome"] == reject_act)).sum())
-        sup_rej_tgt = int(((g["group"] == target_group) & (g["outcome"] == reject_act)).sum())
+        sup_rej_ref = int(((g["group"] == ref_group) & g["is_reject"]).sum())
+        sup_rej_tgt = int(((g["group"] == target_group) & g["is_reject"]).sum())
         p_rej_ref = sup_rej_ref / n_ref
         p_rej_tgt = sup_rej_tgt / n_tgt
         out_reject.append((p_rej_tgt - p_rej_ref) * 100.0)
@@ -1564,7 +1599,7 @@ if not xes_files:
     st.stop()
 
 # ===== Top Toolbar =====
-t1, t2, t3, t4, t5, t6, t7 = st.columns([1.4, 1.6, 1.6, 1.2, 1.4, 1.0, 1.0])
+t1, t2, t3, t4, t5 = st.columns([1.4, 1.6, 1.6, 1.2, 1.4])
 
 dataset = t1.selectbox("Dataset", xes_files, index=0)
 xes_path = os.path.join(data_dir, dataset)
@@ -1602,8 +1637,6 @@ tgt_candidates = [g for g in groups if g != ref_group]
 target_group = t4.selectbox("Target Group", tgt_candidates, index=0)
 
 measure = t5.selectbox("Disparity Measure", ["Δpp", "Ratio"])
-blind_mode = t6.checkbox("Blind Mode", value=False)
-t7.button("Export (later)")
 
 st.divider()
 
@@ -1720,13 +1753,8 @@ with central_pane:
             )
 
     # --- group labels ---
-    if blind_mode:
-        mapped = {g: f"Group {chr(ord('A') + i)}" for i, g in enumerate(groups)}
-        ref_label = mapped[ref_group]
-        tgt_label = mapped[target_group]
-    else:
-        ref_label = str(ref_group)
-        tgt_label = str(target_group)
+    ref_label = str(ref_group)
+    tgt_label = str(target_group)
 
     st.caption(f"Comparing **{tgt_label}** vs **{ref_label}** on **{sensitive_attr}**")
 
@@ -2133,20 +2161,22 @@ with central_pane:
     events_view = events_f
     cases_view = cases_f
     st.caption("Dashboard scope: **all cases** after current filters")
-    st.caption("Outcomes: Offer / Reject (based on last activity) + Processing time (case duration).")
+    st.caption("Outcomes: pick the activity that marks a positive vs. negative case outcome, and how it should be matched (see settings below) + Processing time (case duration).")
 
     acts_view = sorted(events_view['activity'].dropna().unique().tolist(), key=lambda x: str(x))
 
     def _guess_act(pats):
-        for a in acts_view:
-            s = str(a)
-            for pat in pats:
-                if re.search(pat, s, flags=re.IGNORECASE):
+        # Check patterns in priority order (most specific/unambiguous first), scanning
+        # all activities per pattern before moving on - this way pattern priority decides
+        # the winner instead of the activities' alphabetical order.
+        for pat in pats:
+            for a in acts_view:
+                if re.search(pat, str(a), flags=re.IGNORECASE):
                     return a
         return None
 
-    guess_offer = _guess_act([r"offer", r"approved", r"accept"])
-    guess_reject = _guess_act([r"reject", r"rejected", r"declin", r"denied"])
+    guess_offer = _guess_act([r"offer", r"approv", r"\bsign", r"hire", r"accept"])
+    guess_reject = _guess_act([r"reject", r"declin", r"denied", r"evict", r"terminat"])
 
     with st.expander("Outcome dashboard settings", expanded=False):
         if not acts_view:
@@ -2155,17 +2185,33 @@ with central_pane:
             reject_act = None
         else:
             offer_act = st.selectbox(
-                "Offer terminal activity",
+                "Positive outcome activity",
                 options=acts_view,
                 index=(acts_view.index(guess_offer) if guess_offer in acts_view else 0),
+                help="Activity that indicates a successful/positive outcome for this dataset (e.g. a job offer, an approved rental contract).",
                 key='offer_act',
             )
             reject_act = st.selectbox(
-                "Reject terminal activity",
+                "Negative outcome activity",
                 options=acts_view,
                 index=(acts_view.index(guess_reject) if guess_reject in acts_view else min(1, len(acts_view) - 1)),
+                help="Activity that indicates a rejection/negative outcome for this dataset.",
                 key='reject_act',
             )
+
+        outcome_match_mode = st.radio(
+            "Match outcome activity as",
+            options=["Last activity in case", "Anywhere in case"],
+            index=0,
+            horizontal=True,
+            help=(
+                "'Last activity' treats the case's final event as its outcome — correct when the "
+                "outcome activity is truly terminal. Use 'Anywhere in case' when the log keeps "
+                "recording events after the outcome (e.g. 'Move In' / 'Pay Rent' after a signed "
+                "rental contract) or when many cases are censored before reaching a clean terminal state."
+            ),
+            key='outcome_match_mode',
+        )
 
         time_agg = st.selectbox("Processing time aggregation", ["mean", "median"], index=0, key='time_agg')
         band_time_days = st.number_input(
@@ -2185,15 +2231,13 @@ with central_pane:
     if n_ref == 0 or n_tgt == 0:
         st.info("No cases available for one of the selected groups (check filters / selected pattern).")
     else:
-        # ---- Offer / Reject rates (based on last activity) ----
-        last_df = compute_case_last_activity(events_view)
-        oc = last_df.merge(cc, on='case_id', how='inner').rename(columns={sensitive_attr: 'group'})
-
-        def _outcome_row(act_name: str, title: str) -> dict:
+        # ---- Positive / Negative outcome rates (activity occurs anywhere in the case) ----
+        def _outcome_row(act_name: str, title: str, kind: str) -> dict:
             if not act_name:
                 return {
                     'metric': title,
                     'type': 'prob',
+                    'kind': kind,
                     'p_tgt': float('nan'),
                     'p_ref': float('nan'),
                     'delta_pp': float('nan'),
@@ -2205,9 +2249,16 @@ with central_pane:
                     'unknown': True,
                 }
 
-            sup_ref = int(oc[(oc['group'] == ref_group) & (oc['outcome'] == act_name)]['case_id'].nunique())
-            sup_tgt = int(oc[(oc['group'] == target_group) & (oc['outcome'] == act_name)]['case_id'].nunique())
-            sup_all = int(oc[oc['outcome'] == act_name]['case_id'].nunique())
+            if outcome_match_mode == "Anywhere in case":
+                match_cases = compute_case_activity_presence(events_view, act_name)
+            else:
+                match_cases = compute_case_last_activity(events_view)
+                match_cases = match_cases.loc[match_cases['outcome'] == act_name, ['case_id']]
+            oc = cc.merge(match_cases, on='case_id', how='inner').rename(columns={sensitive_attr: 'group'})
+
+            sup_ref = int(oc[oc['group'] == ref_group]['case_id'].nunique())
+            sup_tgt = int(oc[oc['group'] == target_group]['case_id'].nunique())
+            sup_all = int(oc['case_id'].nunique())
 
             p_ref = sup_ref / n_ref
             p_tgt = sup_tgt / n_tgt
@@ -2224,6 +2275,7 @@ with central_pane:
             return {
                 'metric': title,
                 'type': 'prob',
+                'kind': kind,
                 'p_tgt': p_tgt,
                 'p_ref': p_ref,
                 'delta_pp': delta_pp,
@@ -2235,8 +2287,8 @@ with central_pane:
                 'unknown': unknown,
             }
 
-        offer_row = _outcome_row(offer_act, 'Offer rate')
-        reject_row = _outcome_row(reject_act, 'Reject rate')
+        offer_row = _outcome_row(offer_act, f"'{offer_act}' rate" if offer_act else 'Positive outcome rate', kind='positive')
+        reject_row = _outcome_row(reject_act, f"'{reject_act}' rate" if reject_act else 'Negative outcome rate', kind='negative')
 
         # ---- Processing time ----
         case_time_df = compute_case_processing_time(events_view)
@@ -2326,7 +2378,7 @@ with central_pane:
                 r['ci_low'] = lo
                 r['ci_high'] = hi
 
-            if str(r.get('metric', '')).lower().startswith('offer'):
+            if r.get('kind') == 'positive':
                 r['target_worse'] = (float(r.get('delta_pp', 0.0)) < 0.0) if measure == 'Δpp' else (float(r.get('ratio', np.nan)) < 1.0)
             else:
                 r['target_worse'] = (float(r.get('delta_pp', 0.0)) > 0.0) if measure == 'Δpp' else (float(r.get('ratio', np.nan)) > 1.0)
@@ -2364,6 +2416,7 @@ with central_pane:
                 target_group=target_group,
                 offer_act=str(offer_act),
                 reject_act=str(reject_act),
+                match_mode=outcome_match_mode,
                 n_bins=12,
             )
             offer_series = series_or.get('offer', [])
@@ -2391,9 +2444,7 @@ with central_pane:
             if bool(r.get('unknown', False)):
                 return ('pm-unknown', '#999999', 'rgba(0,0,0,0.06)')
             if bool(r.get('is_unfair', False)):
-                if bool(r.get('target_worse', False)):
-                    return ('pm-bad', '#e57373', 'rgba(229,115,115,0.18)')
-                return ('pm-warn', '#ffa726', 'rgba(255,167,38,0.18)')
+                return ('pm-bad', '#e57373', 'rgba(229,115,115,0.18)')
             return ('pm-good', '#66bb6a', 'rgba(102,187,106,0.18)')
 
         def _fmt_ci(lo, hi, unit: str, decimals: int = 1):
@@ -2424,11 +2475,11 @@ with central_pane:
                 if measure == 'Δpp':
                     main = _fmt_main_pp(float(r.get('delta_pp', np.nan)))
                     ci_txt = _fmt_ci(float(r.get('ci_low', np.nan)), float(r.get('ci_high', np.nan)), '', 1)
-                    spark_vals = offer_series if str(r.get('metric','')).lower().startswith('offer') else reject_series
+                    spark_vals = offer_series if r.get('kind') == 'positive' else reject_series
                 else:
                     main = _fmt_main_ratio(float(r.get('ratio', np.nan)))
                     ci_txt = _fmt_ci(float(r.get('ci_low', np.nan)), float(r.get('ci_high', np.nan)), '×', 2)
-                    spark_vals = offer_series if str(r.get('metric','')).lower().startswith('offer') else reject_series
+                    spark_vals = offer_series if r.get('kind') == 'positive' else reject_series
 
                 n_used = int(n_ref + n_tgt)
             else:
